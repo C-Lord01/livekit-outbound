@@ -97,6 +97,7 @@ class Engagement(Base):
         back_populates="engagement"
     )
     audit_log_entries: Mapped[list["AuditLogEntry"]] = relationship(back_populates="engagement")
+    cessation_events: Mapped[list["CessationEvent"]] = relationship(back_populates="engagement")
 
 
 class PhoneNumber(Base):
@@ -140,6 +141,25 @@ class CallAttempt(Base):
     phone_number: Mapped["PhoneNumber"] = relationship(back_populates="call_attempts")
 
 
+class SuppressionKind(str, enum.Enum):
+    """Why contact must stop. The two kinds have different downstream
+    consequences in operations, so they are recorded distinctly."""
+
+    # A request not to be contacted again (do-not-call, stop-contact).
+    STOP_CONTACT = "stop_contact"
+    # The contact stated they are represented by an attorney; further
+    # contact goes through counsel.
+    ATTORNEY_REPRESENTED = "attorney_represented"
+
+
+class DetectionPath(str, enum.Enum):
+    """How an in-call cessation was recognized."""
+
+    FAST_PATH = "fast_path"  # unambiguous phrase list, no classifier involved
+    CLASSIFIER = "classifier"  # the LLM classifier returned a definite verdict
+    FAIL_CLOSED = "fail_closed"  # classifier timed out, errored, or was unsure
+
+
 class SuppressionFlag(Base):
     """Marks that contact on an engagement must stop (e.g. a do-not-call or
     stop-contact request)."""
@@ -151,8 +171,68 @@ class SuppressionFlag(Base):
     flagged_at: Mapped[datetime] = mapped_column(UTCDateTime)
     reason: Mapped[str] = mapped_column(Text)
     source: Mapped[str] = mapped_column(String(100))
+    kind: Mapped[SuppressionKind] = mapped_column(
+        _enum_type(SuppressionKind),
+        default=SuppressionKind.STOP_CONTACT,
+        server_default=SuppressionKind.STOP_CONTACT.value,
+    )
 
     engagement: Mapped["Engagement"] = relationship(back_populates="suppression_flags")
+    cessation_events: Mapped[list["CessationEvent"]] = relationship(
+        back_populates="suppression_flag"
+    )
+
+
+class CessationEvent(Base):
+    """Audit record of a cessation recognized during a live call.
+
+    Lets an auditor reconstruct when during the call the system became aware
+    (``detected_at``, ``external_call_id``), what was said (``utterance``),
+    how it was recognized (``detection_path``, ``detection_detail``), and how
+    long it took to act (``latency_to_durable_ms``: final transcript event to
+    the committed :class:`SuppressionFlag`). ``suppression_durable`` is False
+    only when that write failed, in which case ``suppression_flag_id`` is
+    NULL and the failure is part of the record.
+
+    Timestamps are always real wall-clock instants; there is no simulated
+    marker because this path has no clock injection.
+    """
+
+    __tablename__ = "cessation_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    engagement_id: Mapped[int] = mapped_column(ForeignKey("engagements.id"), index=True)
+    phone_number_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("phone_numbers.id"), nullable=True, index=True
+    )
+    suppression_flag_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("suppression_flags.id"), nullable=True
+    )
+    # Correlation id of the call (the room name), matching CallAttempt.external_call_id.
+    external_call_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    # Wall-clock instant the cessation was recognized.
+    detected_at: Mapped[datetime] = mapped_column(UTCDateTime, index=True)
+    # The final transcript that triggered it.
+    utterance: Mapped[str] = mapped_column(Text)
+    kind: Mapped[SuppressionKind] = mapped_column(_enum_type(SuppressionKind))
+    detection_path: Mapped[DetectionPath] = mapped_column(_enum_type(DetectionPath))
+    # Matched phrase, classifier rationale, or the fail-closed cause.
+    detection_detail: Mapped[str] = mapped_column(Text)
+    # End of the person's speech to the final transcript event, when the
+    # end of speech was observed; NULL otherwise.
+    transcript_delay_ms: Mapped[Optional[float]] = mapped_column(nullable=True)
+    # Final transcript event to the committed suppression flag.
+    latency_to_durable_ms: Mapped[Optional[float]] = mapped_column(nullable=True)
+    suppression_durable: Mapped[bool] = mapped_column(default=False)
+    recorded_at: Mapped[datetime] = mapped_column(UTCDateTime, server_default=func.now())
+
+    __mapper_args__ = {"eager_defaults": True}
+
+    engagement: Mapped["Engagement"] = relationship(back_populates="cessation_events")
+    phone_number: Mapped[Optional["PhoneNumber"]] = relationship()
+    suppression_flag: Mapped[Optional["SuppressionFlag"]] = relationship(
+        back_populates="cessation_events"
+    )
 
 
 class CallingWindowOverride(Base):

@@ -150,6 +150,74 @@ before the SIP INVITE goes out, so the next evaluation counts it. Its
 happened then; when the authorizing decision used `--now`, the attempt's
 `simulated_now` carries the injected instant so it is visibly marked too.
 
+## Mid-call cessation
+
+The gate stops a call before it is placed. During a call, the agent itself
+enforces the two requests that must take effect immediately: a request not
+to be contacted again, and a statement that the person is represented by
+an attorney. When either is recognized, the agent stops during the call
+rather than at the end of it.
+
+Detection runs on **final** transcripts only, off the audio path, in two
+layers:
+
+1. A conservative phrase list ("stop calling me", "take me off your list",
+   "talk to my attorney", ...). A match is a cessation; the classifier is
+   not consulted. This is the backstop: a classifier outage cannot cause a
+   missed cessation.
+2. For everything else, a small LLM classifier (`gpt-4.1-nano`) returns a
+   structured verdict under a 1.5 s timeout. A timeout, an error, or an
+   `unclear` verdict is treated as a cessation. The two mistakes are not
+   symmetric: a wrongly suppressed contact costs one lost conversation; a
+   missed cessation followed by another call is a statutory violation.
+
+Enforcement order is fixed and tested:
+
+1. Detect.
+2. Write a `SuppressionFlag` on the engagement and confirm the commit by
+   reading it back. This is the same row the pre-dial `suppression` rule
+   reads, so the next dial to any of the contact's numbers is denied with
+   `SUPPRESSED`.
+3. Speak a brief, uninterruptible acknowledgement.
+4. Hang up (`OutboundCaller.hangup("cessation: <kind>")`).
+
+The write happens before the hang-up because session teardown removes the
+participant and closes the session within a few hundred milliseconds, and
+a write started at teardown can be lost. If the write fails the call is
+still terminated, the failure is logged at ERROR, and the audit row records
+`suppression_durable = false`. A second detection on the same call is
+logged and ignored.
+
+The two kinds are recorded distinctly (`SuppressionFlag.kind`:
+`stop_contact` or `attorney_represented`) and acknowledged differently.
+
+Every cessation writes one `cessation_events` row:
+
+| Column | Meaning |
+|---|---|
+| `detected_at` | wall-clock instant the cessation was recognized |
+| `external_call_id` | the room name, matching `call_attempts.external_call_id` |
+| `utterance` | the final transcript that triggered it |
+| `kind` | `stop_contact` or `attorney_represented` |
+| `detection_path` | `fast_path`, `classifier`, or `fail_closed` |
+| `detection_detail` | matched phrase, classifier rationale, or the fail-closed cause |
+| `transcript_delay_ms` | end of the person's speech to the final transcript event |
+| `latency_to_durable_ms` | final transcript event to the committed suppression flag |
+| `suppression_durable` | false only when the suppression write failed |
+
+The same figures are logged at INFO on the `cessation durable` line, with
+the detection path, since the fast-path and the classifier have very
+different latencies. `latency_to_durable_ms` is the compliance-relevant
+number: it ends at the commit, not at the acknowledgement or the hang-up.
+There is no simulated marker on this path; an in-call cessation is always a
+live event evaluated on the wall clock.
+
+The dial script passes `contact_id` and `engagement_id` to the agent in the
+dispatch metadata. A job dispatched without an engagement is refused rather
+than run without enforcement. After upgrading, run `scripts/seed_gate.py`
+again: it recreates the schema, which now has the `kind` column and the
+`cessation_events` table.
+
 ## Tests
 
 ```bash
@@ -159,8 +227,20 @@ uv run pytest
 The suite covers each rule's boundaries, the composite gate and its audit
 writes, the area-code table, dialed numbers in a different timezone from
 the server and from the contact record, DST transitions in both directions,
-zones without DST, split area codes, the dialer adapter, and the dial
-script with a fake LiveKit client. Clock injection is covered by
+zones without DST, split area codes, the dialer adapter, the dial
+script with a fake LiveKit client, and the agent's hang-up path with a fake
+session and job context (`tests/test_agent.py`: speech finishes before the
+SIP leg drops, the session is closed, a callee who already hung up is
+tolerated, and the `end_call` tool delegates to it). Mid-call cessation is
+covered by `tests/test_cessation_detect.py` (fast-path phrases with the
+classifier broken, classifier-only phrasing, timeout, error, and ambiguous
+verdicts failing closed, ordinary speech passing), `tests/test_cessation_monitor.py`
+(finals only, write before hang-up asserted by call order, write failure
+still terminates and logs ERROR, double-detection guard, both kinds recorded
+distinctly, latency logged with the detection path), and
+`tests/gate/test_cessation.py` (the audit row, and the gate denying with
+`SUPPRESSED` after a cessation, including through the dialer's own
+`authorize`). Clock injection is covered by
 `tests/gate/test_clock.py` (no rule reads the wall clock, statically and at
 runtime; naive instants rejected; the simulated marker) and
 `tests/test_clock_override.py` (same number denied before the window and
@@ -170,15 +250,20 @@ that the environment cannot inject the clock).
 ## Layout
 
 ```
-agent.py                         the voice agent that joins the call
+agent.py                         the voice agent that joins the call; OutboundCaller.hangup() ends it
 scripts/
   create_trunk.py                create or find the outbound SIP trunk
   seed_gate.py                   reset and seed the local gate database
   dial.py                        gate, then room, dispatch, attempt, SIP dial
 src/livekit_outbound/
   predial.py                     dialer-side adapter: number -> contact/engagement -> gate
+  cessation/
+    detect.py                    phrase fast-path, LLM classifier, fail-closed detector
+    monitor.py                   transcripts -> detect -> durable write -> acknowledge -> hang up
+    store.py                     agent-side adapter onto the gate database
   gate/
     decide.py                    composite ALLOW/DENY, rule registry, audit write
+    cessation.py                 in-call suppression write (confirmed) and the cessation audit row
     frequency.py                 7-in-7 rolling frequency cap
     cooldown.py                  7-day post-conversation cooldown
     time_window.py               8am to 9pm local-time window

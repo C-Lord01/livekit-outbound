@@ -87,7 +87,11 @@ class _FakeRoomService:
 
 
 class _FakeDispatchService:
+    def __init__(self) -> None:
+        self.requests = []
+
     async def create_dispatch(self, request):
+        self.requests.append(request)
         return SimpleNamespace(id="AD_fake", agent_name=request.agent_name)
 
 

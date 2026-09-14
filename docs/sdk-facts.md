@@ -309,3 +309,179 @@ Humans open with "hello", "hi", a name, or a question.
 A third, weaker signal is the beep tone that ends most voicemail greetings. Nothing in the
 installed packages detects it, so it would require custom audio-frame analysis on the
 subscribed track; it is not proposed as a primary fallback.
+
+---
+
+## 7. Ending a call from inside the agent
+
+Used by `OutboundCaller.hangup()` in `agent.py`. The order is: let in-flight
+speech finish, remove the SIP participant, close the session, then shut the job
+down from the session's `close` handler.
+
+**Letting speech finish**
+
+- From inside a function tool, use `RunContext.wait_for_playout()`
+  (`SP/livekit/agents/voice/events.py:103-110`). It waits only for the words spoken
+  before the tool call (`speech_handle._wait_for_generation(step_idx=...)`).
+- `SpeechHandle.wait_for_playout()` (`SP/livekit/agents/voice/speech_handle.py:205`)
+  waits for the whole assistant turn, tool calls included. Calling it on the handle
+  that owns the running tool raises `RuntimeError` (guard at
+  `speech_handle.py:216-228`), which is why the tool path must use the `RunContext`
+  variant. Outside a tool, `AgentSession.current_speech`
+  (`SP/livekit/agents/voice/agent_session.py:801`) plus `wait_for_playout()` is correct.
+- `RunContext` is exported from `livekit.agents` (`SP/livekit/agents/__init__.py:98`).
+
+**Removing the SIP participant**
+
+- `RoomService.remove_participant(RoomParticipantIdentity) -> RemoveParticipantResponse`
+  (`SP/livekit/api/room_service.py:190-208`). Reach it as `JobContext.api.room`
+  (`JobContext.api` at `SP/livekit/agents/job.py:438`).
+- `RoomParticipantIdentity(room: str, identity: str, revoke_token_ts: int)`
+  (`SP/livekit/protocol/room.pyi:101-109`, re-exported by `livekit.api`).
+- Errors are `livekit.api.TwirpError`, an alias of `ServerError`
+  (`SP/livekit/api/twirp_client.py:137`), with `.code` and `.message` properties
+  (lines 64-70). Codes are on `TwirpErrorCode` (alias of `ServerErrorCode`, line 162):
+  `NOT_FOUND = "not_found"` (line 146) is what a callee who already hung up produces.
+- Fallback: `JobContext.delete_room()` (`job.py:680-700`) disconnects everyone; it
+  swallows NOT_FOUND and logs other errors itself, and is a no-op in console mode.
+
+**Why the session must be closed explicitly after `remove_participant`**
+
+- `RoomIO._on_participant_disconnected` (`SP/livekit/agents/voice/room_io/room_io.py:406-428`)
+  only closes the session when `close_on_disconnect` is set **and** the disconnect
+  reason is in `DEFAULT_CLOSE_ON_DISCONNECT_REASONS`
+  (`SP/livekit/agents/voice/room_io/types.py:17-21`): `CLIENT_INITIATED`,
+  `ROOM_DELETED`, `USER_REJECTED`. An API removal is `PARTICIPANT_REMOVED`, which is
+  not on that list, so the callee hanging up closes the session automatically but
+  the agent hanging up does not.
+
+**Closing the session**
+
+- `AgentSession.shutdown(*, drain: bool = True)` (`agent_session.py:1212-1213`) is
+  non-blocking: it schedules `_aclose_impl` with `CloseReason.USER_INITIATED` via
+  `_close_soon` (lines 1199-1210), which is idempotent (`if self._closing_task: return`).
+- `AgentSession.aclose()` (`agent_session.py:1353`) is the awaitable form but uses
+  `drain=False`, which force-interrupts current speech (`_aclose_impl`, lines 1261-1268).
+  With `drain=True` it calls `activity.drain()` (`agent_activity.py:1219`), which runs
+  `Agent.on_exit` and then waits for the current speech to finish. From inside a
+  function tool the current speech **is** the tool's own turn, so awaiting the close
+  there would deadlock; schedule it with `shutdown()` and return from the tool.
+- `CloseReason` values (`SP/livekit/agents/voice/events.py:569-575`): `error`,
+  `job_shutdown`, `participant_disconnected`, `user_initiated`, `task_completed`.
+  `CloseEvent` (lines 577-583) carries `reason` and `error`; the session emits
+  `"close"` (in `EventTypes`, `events.py:305`) at `agent_session.py:1327`, before
+  `room_io.aclose()`.
+
+**Suppressing the spoken reply after the tool**
+
+- Raise `StopResponse` (`SP/livekit/agents/llm/tool_context.py:140-148`, exported from
+  `livekit.agents` at `__init__.py:56`) from the tool. The tool executor treats it as
+  "no reply" (`SP/livekit/agents/voice/tool_executor.py:375`, `454-456`).
+
+**Ending the job**
+
+- `JobContext.shutdown(reason: str = "user requested")` (`job.py:798-799`) calls the
+  worker's `_on_ctx_shutdown`, which resolves the job's shutdown future
+  (`SP/livekit/agents/ipc/job_proc_lazy_main.py:294-300`). It is synchronous and safe
+  to call from a session event callback. The worker then runs
+  `add_shutdown_callback` hooks (`job_proc_lazy_main.py:434-437`) and disconnects.
+- Without it, the job ends when the room closes, i.e. after the room's
+  `departure_timeout` (`SP/livekit/protocol/room.pyi:38`) once the last non-agent
+  participant is gone.
+
+**Method-based tools on an `Agent` subclass**
+
+- `Agent.__init__` collects `@function_tool` methods with `find_function_tools(self)`
+  (`SP/livekit/agents/voice/agent.py:91`); `Agent.tools` (line 166) lists them.
+- `_BaseFunctionTool.__get__` (`tool_context.py:248-258`) binds the tool to the
+  instance and drops `self` from the published signature, so `agent.end_call(ctx, ...)`
+  is directly callable in tests.
+- The tool's docstring becomes its description and the `Args:` section documents
+  each parameter for the LLM (`tool_context.py:401` builds the `Annotated` schema).
+
+---
+
+## 8. Mid-call cessation: transcripts, timing, structured classification, speech control
+
+Used by `livekit_outbound.cessation` (the monitor and the LLM classifier) and by
+`agent.py`.
+
+**Final transcripts and their timestamp**
+
+- `UserInputTranscribedEvent` (`SP/livekit/agents/voice/events.py:327-335`) has
+  `transcript`, `is_final`, and `created_at: float` (a `time.time()` stamped when the
+  event object is built). `created_at` is the anchor for the latency measurement:
+  final transcript event to durable suppression.
+- It does **not** carry a `transcript_delay` field in 1.8.1. The SDK computes that
+  figure only as a debug log extra in `AudioRecognition`
+  (`SP/livekit/agents/voice/audio_recognition.py:1213-1215`,
+  `time.time() - self._last_speaking_time`), and `_last_speaking_time` is private
+  (line 280). The public equivalent is derived from the user-state transition below.
+- The end-of-utterance metrics event (`EOUMetrics`, `SP/livekit/agents/metrics/base.py:106-124`)
+  carries `transcription_delay` and `end_of_utterance_delay`, but it is emitted per
+  committed user turn via `metrics_collected`, after the transcript event and without
+  a shared key, so it is not used to stamp the cessation record.
+
+**End of speech (for the transcript-delay figure)**
+
+- `UserStateChangedEvent` (`events.py:313-317`): `old_state`, `new_state`,
+  `created_at`. The session emits it from `_update_user_state`
+  (`SP/livekit/agents/voice/agent_session.py:2038-2084`); on the `speaking ->
+  listening` transition `created_at` is `time.time()` at the transition (line 2082,
+  `last_speaking_time` is only passed for the `speaking` state). The monitor records
+  that instant and reports `transcript_delay_ms = transcript.created_at - it`.
+- Both events are in `EventTypes` (`events.py:291-307`) and are delivered
+  synchronously inside `emit` (`SP/livekit/rtc/event_emitter.py`), so the handlers
+  only schedule a task (`asyncio.create_task`) and return; detection never runs on
+  the audio path.
+
+**Structured classification with the OpenAI plugin**
+
+- Base `LLM.chat` (`SP/livekit/agents/llm/llm.py:159-168`) has no response-format
+  parameter. The OpenAI plugin's `LLM.chat` (`SP/livekit/plugins/openai/llm.py:947-959`)
+  adds `response_format`, accepting a pydantic model class; it is converted with
+  `to_openai_response_format` (`SP/livekit/agents/llm/utils.py:296-309`) into a
+  strict `json_schema` response format (`strict: True`, all fields required).
+- `LLMStream.collect()` (`llm.py:510-540`) drains the stream and returns
+  `CollectedResponse` (`llm.py:71-77`) whose `.text` is the JSON to validate with
+  `Verdict.model_validate_json`.
+- `openai.LLM(...)` constructor (`SP/livekit/plugins/openai/llm.py:92-106`):
+  `model`, `temperature`, `max_completion_tokens`, `timeout`. `gpt-4.1-nano` is in
+  the plugin's `ChatModels` list (`SP/livekit/plugins/openai/models.py`).
+- `LLM.prewarm()` (`llm.py:170`) opens DNS/TLS ahead of the first request. The session
+  prewarms its own LLM automatically; a second LLM instance (the classifier) must be
+  prewarmed explicitly. Measured on this machine: first classifier call 3.2 s cold,
+  1.0-1.5 s warm with a sentence-long rationale; the rationale was capped for that
+  reason.
+- `ChatContext.empty()` / `add_message(role=, content=)`
+  (`SP/livekit/agents/llm/chat_context.py:420, 435`).
+
+**Interrupting and speaking uninterruptibly**
+
+- `AgentSession.interrupt(*, force=False)` (`agent_session.py:1556-1574`) interrupts
+  the current speech and everything queued; raises `RuntimeError` if the session is
+  not running or if the current speech disallows interruptions and `force` is False.
+  `AgentActivity.interrupt` (`SP/livekit/agents/voice/agent_activity.py:1742-1790`)
+  also clears the queue, so a reply already scheduled for the triggering utterance
+  is dropped before the acknowledgement is spoken.
+- `AgentSession.say(text, *, allow_interruptions=..., add_to_chat_ctx=True)`
+  (`agent_session.py:1452-1484`) returns a `SpeechHandle`; raises `RuntimeError` when
+  the session is not running or is closing. `SpeechHandle.wait_for_playout()`
+  (`speech_handle.py:205`) completes when the acknowledgement has played out.
+
+**Job shutdown callbacks (protecting an in-flight write)**
+
+- `JobContext.add_shutdown_callback(cb)` (`SP/livekit/agents/job.py:581-598`): a
+  coroutine function taking zero or one (`reason: str`) argument. The arity check
+  uses `__code__.co_argcount`, so a bound method with defaulted parameters is
+  miscounted as taking the reason; register a zero-argument wrapper. The worker
+  awaits every callback before the process exits
+  (`SP/livekit/agents/ipc/job_proc_lazy_main.py:434-437`), which is what lets
+  `CessationMonitor.drain()` finish a suppression write that started just before
+  teardown.
+
+**Database from the event loop**
+
+- The gate engine is created with `check_same_thread=False`
+  (`src/livekit_outbound/gate/db.py:88-92`) so the synchronous SQLAlchemy writes can
+  run under `asyncio.to_thread` without blocking turn handling.

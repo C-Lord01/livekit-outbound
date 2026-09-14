@@ -157,8 +157,16 @@ async def _place_call(
         )
         print(f"room: {room.name}")
 
+        # The agent needs the gate subject (contact, engagement) so that a
+        # cessation during the call can be written against the same
+        # engagement the pre-dial suppression rule reads.
         metadata = json.dumps(
-            {"phone_number": phone_number, "participant_identity": participant_identity}
+            {
+                "phone_number": phone_number,
+                "participant_identity": participant_identity,
+                "contact_id": authorization.contact.id,
+                "engagement_id": authorization.engagement.id,
+            }
         )
         dispatch = await lkapi.agent_dispatch.create_dispatch(
             api.CreateAgentDispatchRequest(agent_name=agent_name, room=room_name, metadata=metadata)
@@ -202,7 +210,10 @@ async def _place_call(
             sys.exit(EXIT_CALL_FAILED)
 
         print(f"answered: participant {info.participant_identity} sid={info.participant_id}")
-        print("The agent is now on the call. Hang up from the phone to end it.")
+        print(
+            "The agent is now on the call. It hangs up when the person says goodbye "
+            "or asks it to; you can also hang up from the phone."
+        )
     finally:
         await lkapi.aclose()
 

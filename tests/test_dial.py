@@ -9,6 +9,7 @@ audit row behind.
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -68,6 +69,15 @@ def test_clean_number_dials_and_records_attempt_and_allow_audit(
     assert request.sip_trunk_id == "ST_fake"
     assert request.wait_until_answered is True
     assert lk.closed is True
+
+    # The agent gets the gate subject, so an in-call cessation can be written
+    # against the same engagement the suppression rule reads.
+    (dispatch,) = lk.agent_dispatch.requests
+    metadata = json.loads(dispatch.metadata)
+    assert metadata["phone_number"] == CONTACT_C_NUMBER
+    assert metadata["participant_identity"] == request.participant_identity
+    assert metadata["engagement_id"] == engagement_id_for(gate_db, "Test Contact C")
+    assert isinstance(metadata["contact_id"], int)
 
     newest_audit = rows(gate_db, AuditLogEntry)[-1]
     assert newest_audit.decision is AuditDecision.ALLOW

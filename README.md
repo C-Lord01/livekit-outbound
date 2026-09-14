@@ -2,7 +2,7 @@
 
 A working prototype of the compliance layer that every outbound voice-AI customer builds themselves, and that no platform currently provides.
 
-**[Three-minute demo](https://youtu.be/BrOzCmJzdts)** · **[Written point of view (PDF)](./Chris-Kulpa-LiveKit-Telephony-POV.pdf)**
+**[Two-minute demo](https://youtu.be/BrOzCmJzdts)** · **[Written point of view (PDF)](./Chris-Kulpa-LiveKit-Telephony-POV.pdf)**
 
 ---
 

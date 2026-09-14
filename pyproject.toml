@@ -15,6 +15,8 @@ dependencies = [
     "livekit-plugins-openai>=1.8.1",
     "livekit-plugins-silero>=1.8.1",
     "python-dotenv>=1.2.3",
+    "sqlalchemy>=2.0",
+    "tzdata>=2024.1",
 ]
 
 [project.scripts]
@@ -23,3 +25,12 @@ livekit-outbound = "livekit_outbound:main"
 [build-system]
 requires = ["uv_build>=0.12.13,<0.13.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

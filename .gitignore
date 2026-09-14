@@ -13,3 +13,7 @@ wheels/
 .env
 .env.*
 !.env.example
+
+# Local policy-gate database
+data/
+*.db
